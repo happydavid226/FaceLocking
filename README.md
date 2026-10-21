@@ -114,6 +114,71 @@ confidence is shown only for eligible detections; no eligible face can also mean
 the face is smaller than the 70-pixel minimum. These readings help distinguish
 detection failures from identity matching failures when lighting changes.
 
+## Whole-person tracking and face association
+
+The new `src.whole_person_tracking` module keeps identity and location as
+separate signals. OpenCV's built-in HOG people detector runs on the CPU, while
+YuNet supplies faces and ArcFace verifies the enrolled target. A face is
+associated with the body whose box contains it; body motion alone never proves
+identity.
+
+The tracker exposes three honest states:
+
+* `Confirmed`: the target face matched the enrolled identity this frame.
+* `Temporary`: the face is temporarily absent, but the same body remains
+  spatially continuous. Confidence is multiplied by `exp(-decay_rate)` each
+  frame, so this state cannot persist indefinitely.
+* `Unknown`: there is no trustworthy face/body continuity, the confidence floor
+  was crossed, or a visible face failed the target match. A body box may still
+  be shown as `Unknown`; that is a location observation without an identity
+  claim.
+
+When the face returns and ArcFace matches the enrolled target on the associated
+body, the state returns to `Confirmed` and confidence is refreshed from that
+match. The model files are `models/detector_yunet.onnx` (YuNet face detection
+and landmarks) and `models/embedder_arcface.onnx` (ArcFace ResNet100 identity
+embeddings); both are run on CPU through ONNX Runtime.
+
+Body detection starts independently of face confirmation. A person can enter
+side-on or with their face outside the frame and still appear as `Unknown`;
+when a matching face is later observed on that body, the state becomes
+`Confirmed`.
+
+Run the model-free evaluation (no webcam, model weights, or ONNX Runtime are
+needed):
+
+```powershell
+py -3.12 -m src.whole_person_tracking --evaluate
+```
+
+It exercises head turns, sustained occlusion, path crossing, and a body-detector
+dropout and prints the state sequence and pass/fail result for each scenario.
+For a live CPU-only
+webcam run, enroll a person first and then use:
+
+```powershell
+py -3.12 -m src.whole_person_tracking --target "Isaac" --camera 0
+```
+
+The window shows the body box, state, decayed confidence, and `LEFT`, `RIGHT`,
+`UP`, `DOWN`, or `CENTER` centring signal. Tune `--decay-rate`,
+`--temporary-floor`, and `--max-temporary-frames` to match the camera's frame
+rate and the amount of occlusion you want to tolerate. After a confirmed body
+box is seen, an OpenCV CSRT tracker continues predicting that body when HOG
+temporarily returns no box; the prediction is only used for `Temporary`
+continuity and is reset as soon as the state becomes `Unknown`. Live YuNet uses a
+moderate `--face-confidence 0.60` cutoff by default; raise it if false face
+detections appear. The HOG detector is a portable baseline. If HOG misses a
+close-up or seated subject, the live path
+adds a conservative face-guided upper-body prior and shows `faces=...`,
+`bodies=...`, `hog=...`, `pose=...`, and `motion=...` diagnostics at the bottom
+of the window. When the pinned MediaPipe 0.10 runtime is available, its CPU
+pose detector supplies an independent body box even when no face is visible.
+The status text also shows the current reason and ArcFace match score, which
+distinguishes `faces=0` from a detected face that failed the identity threshold.
+The tracker accepts any detector exposing `detect(frame)` that returns
+`PersonDetection` records when a stronger CPU detector is needed.
+
 ### Tracking logs
 
 Every tracking run automatically creates a unique CSV file under `data/logs/`
@@ -206,6 +271,7 @@ FaceX/
     enroll.py           Quality-gated webcam enrollment
     recognize.py        Webcam recognition
     evaluate.py         Held-out image evaluation
+    whole_person_tracking.py  CPU whole-person tracking and face association
     harr_5pt.py          Landmark/alignment preview
     config.py           Project-relative paths
     workflow.py         CLI helpers and camera cleanup
