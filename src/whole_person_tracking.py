@@ -528,14 +528,17 @@ class WholePersonTracker:
                                  "No trustworthy face/body continuity", self.frame_index)
 
 
-def draw_result(frame: np.ndarray, result: WholePersonResult) -> np.ndarray:
+def draw_result(frame: np.ndarray, result: WholePersonResult,
+                locked_name: Optional[str] = None) -> np.ndarray:
     """Draw the result after inference, keeping overlays out of face crops."""
     if result.person is not None:
         x1, y1, x2, y2 = np.rint(result.person.box).astype(int)
         color = {IdentityState.CONFIRMED: (0, 210, 0), IdentityState.TEMPORARY: (0, 180, 255),
                  IdentityState.UNKNOWN: (0, 80, 255)}[result.state]
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        label = f"{result.state.value} {result.confidence:.2f}"
+        identity = (locked_name or "Locked person") if result.state in (
+            IdentityState.CONFIRMED, IdentityState.TEMPORARY) else "Unknown"
+        label = f"{result.state.value}: {identity} {result.confidence:.2f}"
         cv2.putText(frame, label, (max(0, x1), max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
     if result.face is not None:
         fx, fy, fw, fh = np.rint(result.face.box).astype(int)
@@ -543,7 +546,9 @@ def draw_result(frame: np.ndarray, result: WholePersonResult) -> np.ndarray:
     if result.signal is not None:
         cv2.putText(frame, f"centre: {result.signal.horizontal}/{result.signal.vertical}", (10, 26),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-    cv2.putText(frame, f"{result.state.value} | confidence {result.confidence:.3f}", (10, 52),
+    identity = (locked_name or "Locked person") if result.state in (
+        IdentityState.CONFIRMED, IdentityState.TEMPORARY) else "Unknown"
+    cv2.putText(frame, f"{result.state.value}: {identity} | confidence {result.confidence:.3f}", (10, 52),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     reason = result.reason[:58]
     cv2.putText(frame, reason, (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
@@ -663,6 +668,8 @@ def _live(args: argparse.Namespace) -> None:
     window = "FaceX whole-person tracking"
     try:
         with camera(args.camera) as cap:
+            cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+            cv2.setWindowProperty(window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
             while True:
                 frame = read_frame(cap)
                 current_frame[0] = frame
@@ -685,7 +692,7 @@ def _live(args: argparse.Namespace) -> None:
                         continuity.start(frame, result.person)
                 elif result.state == IdentityState.UNKNOWN and result.person is None:
                     continuity.reset()
-                draw_result(frame, result)
+                draw_result(frame, result, args.target)
                 for face in faces:
                     if face is result.face:
                         continue
