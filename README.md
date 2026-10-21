@@ -125,17 +125,22 @@ identity.
 The tracker exposes three honest states:
 
 * `Confirmed`: the target face matched the enrolled identity this frame.
-* `Temporary`: the face is temporarily absent, but the same body remains
-  spatially continuous. Confidence is multiplied by `exp(-decay_rate)` each
-  frame, so this state cannot persist indefinitely.
-* `Unknown`: there is no trustworthy face/body continuity, the confidence floor
-  was crossed, or a visible face failed the target match. A body box may still
-  be shown as `Unknown`; that is a location observation without an identity
-  claim.
+* `Temporary`: a previously confirmed face/body lock remains on the tracked
+  body while the face is absent, turned, occluded, blurred, or not confidently
+  recognized. Confidence is multiplied by `exp(-decay_rate)` each frame, so
+  this state cannot persist indefinitely.
+* `Unknown`: no target face/body lock has been established, or the continuity
+  window/confidence floor expired. A body box may still be shown as `Unknown`;
+  that is a location observation without an identity claim.
 
 When the face returns and ArcFace matches the enrolled target on the associated
 body, the state returns to `Confirmed` and confidence is refreshed from that
-match. The model files are `models/detector_yunet.onnx` (YuNet face detection
+match. A face on the locked body that cannot be matched keeps the lock
+`Temporary` until it is verified or the continuity window expires. To reduce
+state flicker from a poor embedding, three consecutive visible-face
+identity misses are tolerated by default (`--face-mismatch-grace 3`). An absent
+face still changes to `Temporary` immediately. The model files are
+`models/detector_yunet.onnx` (YuNet face detection
 and landmarks) and `models/embedder_arcface.onnx` (ArcFace ResNet100 identity
 embeddings); both are run on CPU through ONNX Runtime.
 

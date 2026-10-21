@@ -317,7 +317,7 @@ class FaceBodyAssociator:
 
 
 class WholePersonTracker:
-    """Track one identity while exposing explicit temporal uncertainty.
+    """Lock a confirmed face identity to its associated body over time.
 
     ``identity_match`` receives a face and returns ``(is_target, score)``.
     Scores are expected to be cosine-like values in ``[-1, 1]``.  A confirmed
@@ -329,17 +329,21 @@ class WholePersonTracker:
     def __init__(self, identity_match: Callable[[Face], tuple[bool, Optional[float]]],
                  *, decay_rate: float = 0.35, temporary_floor: float = 0.20,
                  max_temporary_frames: int = 24, association_threshold: float = 0.05,
-                 ema_alpha: float = 0.35, dead_zone: float = 0.08):
+                 ema_alpha: float = 0.35, dead_zone: float = 0.08,
+                 face_mismatch_grace: int = 3):
         if decay_rate <= 0 or not 0 < temporary_floor < 1:
             raise ValueError("decay_rate must be positive and temporary_floor in (0,1)")
         if not isinstance(max_temporary_frames, int) or max_temporary_frames < 0:
             raise ValueError("max_temporary_frames must be a non-negative integer")
+        if not isinstance(face_mismatch_grace, int) or face_mismatch_grace < 0:
+            raise ValueError("face_mismatch_grace must be a non-negative integer")
         if not 0 < ema_alpha <= 1 or not 0 <= dead_zone < 1:
             raise ValueError("ema_alpha must be in (0,1] and dead_zone in [0,1)")
         self.identity_match = identity_match
         self.decay_rate = float(decay_rate)
         self.temporary_floor = float(temporary_floor)
         self.max_temporary_frames = max_temporary_frames
+        self.face_mismatch_grace = face_mismatch_grace
         self.association_threshold = float(association_threshold)
         self.ema_alpha, self.dead_zone = float(ema_alpha), float(dead_zone)
         self.associator = FaceBodyAssociator()
@@ -349,6 +353,7 @@ class WholePersonTracker:
         self.last_face: Optional[Face] = None
         self.smooth_center: Optional[np.ndarray] = None
         self.temporary_frames = 0
+        self.unverified_face_frames = 0
         self.frame_index = 0
 
     @staticmethod
@@ -392,16 +397,18 @@ class WholePersonTracker:
         associations = self.associator.associate(faces, persons)
         body = self._body_match(persons)
         held_body = False
-        # A detector can miss the body in the same frame YuNet loses the face.
-        # Hold the last confirmed box for the bounded temporary window so one
-        # missed detection does not immediately erase temporal continuity.
-        if (body is None and not faces and self.last_person is not None
+        # A detector can miss the body while unrelated faces remain visible.
+        # The state is about the previously locked body: if no current body
+        # measurement matches it, hold that body briefly unless a positive
+        # face match below reacquires the target elsewhere.
+        if (body is None and self.last_person is not None
                 and self.state in (IdentityState.CONFIRMED, IdentityState.TEMPORARY)
                 and self.temporary_frames < self.max_temporary_frames):
             body = self.last_person
             held_body = True
         chosen: Optional[Association] = None
         chosen_identity: Optional[tuple[bool, Optional[float]]] = None
+        uncertain_face: Optional[Face] = None
         body_pair: Optional[Association] = None
         if body is not None:
             for pair in associations:
@@ -413,20 +420,34 @@ class WholePersonTracker:
         # overlap. A shifted HOG/pose box must not turn a visible target face
         # into Unknown just because geometric association missed for one frame.
         # Search for a positive identity match first, including during recovery
-        # from Temporary and while body tracking catches up.
+        # from Temporary and while body tracking catches up. Keep unassociated
+        # face detections in the check too: a slightly wrong body box should
+        # not make an otherwise visible, matching face look absent.
         matches: list[tuple[float, Association, tuple[bool, Optional[float]]]] = []
-        for pair in associations:
+        uncertain_pairs: list[tuple[Association, tuple[bool, Optional[float]]]] = []
+        pair_by_face = {id(pair.face): pair for pair in associations}
+        for face in faces:
+            pair = pair_by_face.get(id(face))
+            if pair is None:
+                if body is None:
+                    continue
+                pair = Association(body, face, 0.0)
             identity = self.identity_match(pair.face)
             is_target, score = identity
             if is_target and score is not None:
                 matches.append((float(score), pair, identity))
+            else:
+                uncertain_pairs.append((pair, identity))
         if matches:
             _, chosen, chosen_identity = max(matches, key=lambda item: item[0])
         elif body_pair is not None:
-            # A visible non-target face on the tracked body is negative
-            # evidence; do not preserve the old identity through it.
+            # Preserve the locked body's face observation for the uncertainty
+            # path below; a failed match alone is not enough to discard lock.
             chosen = body_pair
-            chosen_identity = self.identity_match(body_pair.face)
+            chosen_identity = next((identity for pair, identity in uncertain_pairs
+                                    if pair.face is body_pair.face), None)
+        elif uncertain_pairs and body is not None:
+            chosen, chosen_identity = max(uncertain_pairs, key=lambda item: item[0].score)
 
         if chosen is not None:
             is_target, score = (chosen_identity if chosen_identity is not None
@@ -435,29 +456,49 @@ class WholePersonTracker:
                 self.state = IdentityState.CONFIRMED
                 self.confidence = max(self.confidence * 0.65, self._confidence(score))
                 self.temporary_frames = 0
+                self.unverified_face_frames = 0
                 self.last_face = chosen.face
                 signal = self._remember(chosen.person, frame_shape)
                 return WholePersonResult(self.state, self.confidence, chosen.person, chosen.face,
                                          signal, "Face identity confirmed", self.frame_index, score)
-            # A visible face that fails identity matching is negative evidence,
-            # not a facial-loss gap.  Do not carry the old identity through it.
-            self.state = IdentityState.UNKNOWN
-            self.confidence = 0.0
-            self.last_face = None
-            signal = self._remember(chosen.person, frame_shape)
-            return WholePersonResult(self.state, self.confidence, chosen.person, chosen.face, signal,
-                                     "Face does not match target identity", self.frame_index, score)
+            if (body is not None and self.state in
+                    (IdentityState.CONFIRMED, IdentityState.TEMPORARY)):
+                # A face on the already-locked body can be turned, blurred,
+                # partially occluded, or briefly misclassified. Keep the body
+                # lock as Temporary; only a positive target match reconfirms.
+                uncertain_face = chosen.face
+                self.unverified_face_frames += 1
+                if (self.state == IdentityState.CONFIRMED
+                        and self.unverified_face_frames <= self.face_mismatch_grace):
+                    # A transient ArcFace false negative should not flicker
+                    # the state when the face is visibly still present.
+                    self.confidence *= math.exp(-self.decay_rate * 0.1)
+                    signal = self._remember(body, frame_shape)
+                    return WholePersonResult(
+                        IdentityState.CONFIRMED, self.confidence, body, uncertain_face,
+                        signal, "Face detected; smoothing identity mismatch", self.frame_index, score)
+            else:
+                # Before a face/body lock exists, a failed face match cannot
+                # inherit somebody else's identity.
+                self.state = IdentityState.UNKNOWN
+                self.confidence = 0.0
+                self.last_face = None
+                signal = self._remember(chosen.person, frame_shape)
+                return WholePersonResult(self.state, self.confidence, chosen.person, chosen.face, signal,
+                                         "Face does not match target identity", self.frame_index, score)
 
         if body is not None and self.state in (IdentityState.CONFIRMED, IdentityState.TEMPORARY):
             self.last_face = None
+            self.unverified_face_frames = 0
             self.temporary_frames += 1
             self.confidence *= math.exp(-self.decay_rate)
             if self.temporary_frames <= self.max_temporary_frames and self.confidence >= self.temporary_floor:
                 self.state = IdentityState.TEMPORARY
                 signal = self._remember(body, frame_shape)
-                return WholePersonResult(self.state, self.confidence, body, None, signal,
-                                         ("Face lost; holding last body box briefly" if held_body else
-                                          "Face temporarily unavailable; body continuity retained"),
+                reason = ("Face unclear; locked body retained temporarily" if uncertain_face is not None else
+                          "Face lost; holding last body box briefly" if held_body else
+                          "Face temporarily unavailable; body continuity retained")
+                return WholePersonResult(self.state, self.confidence, body, uncertain_face, signal, reason,
                                          self.frame_index)
 
         self.state = IdentityState.UNKNOWN
@@ -602,6 +643,10 @@ def _live(args: argparse.Namespace) -> None:
     pose_detector = PosePersonDetector()
     continuity = BodyContinuityTracker(args.max_temporary_frames)
     def identity(face: Face) -> tuple[bool, Optional[float]]:
+        # Keep small detections visible to the temporal tracker, but do not
+        # treat an upscaled, low-detail crop as reliable identity evidence.
+        if min(face.box[2:4]) < args.min_face_size:
+            return False, None
         try:
             vector = embedder.embed(align_face(current_frame[0], face.points))
             name, score = db.match(vector, args.threshold, args.margin)
@@ -612,7 +657,8 @@ def _live(args: argparse.Namespace) -> None:
     tracker = WholePersonTracker(identity, decay_rate=args.decay_rate,
                                  temporary_floor=args.temporary_floor,
                                  max_temporary_frames=args.max_temporary_frames,
-                                 dead_zone=args.dead_zone)
+                                 dead_zone=args.dead_zone,
+                                 face_mismatch_grace=args.face_mismatch_grace)
     current_frame = [None]
     window = "FaceX whole-person tracking"
     try:
@@ -620,7 +666,10 @@ def _live(args: argparse.Namespace) -> None:
             while True:
                 frame = read_frame(cap)
                 current_frame[0] = frame
-                faces = [face for face in detector.detect(frame) if min(face.box[2:4]) >= args.min_face_size]
+                # Preserve every YuNet detection for the body lock. Faces below
+                # the ArcFace size floor count as uncertain, not as a sudden
+                # disappearance; identity() rejects their embeddings above.
+                faces = detector.detect(frame)
                 hog_persons = person_detector.detect(frame)
                 pose_persons = pose_detector.detect(frame)
                 detected_persons = merge_person_detections(hog_persons, pose_persons)
@@ -631,12 +680,19 @@ def _live(args: argparse.Namespace) -> None:
                 if not faces and predicted is not None:
                     persons.append(predicted)
                 result = tracker.update(faces, persons, frame.shape)
-                if result.person is not None:
+                if result.person is not None and any(result.person is item for item in persons):
                     if continuity.last_box is None or predicted is None or result.person is not predicted:
                         continuity.start(frame, result.person)
                 elif result.state == IdentityState.UNKNOWN and result.person is None:
                     continuity.reset()
                 draw_result(frame, result)
+                for face in faces:
+                    if face is result.face:
+                        continue
+                    fx, fy, fw, fh = np.rint(face.box).astype(int)
+                    cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), (255, 190, 0), 1)
+                    cv2.putText(frame, "face detected", (max(0, fx), max(16, fy - 5)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 190, 0), 1, cv2.LINE_AA)
                 cv2.putText(frame, f"faces={len(faces)} bodies={len(persons)} "
                                   f"hog={len(hog_persons)} pose={len(pose_persons)} "
                                   f"motion={'yes' if predicted is not None else 'no'}",
@@ -672,6 +728,8 @@ def main() -> None:
     cli.add_argument("--decay-rate", type=float, default=0.08)
     cli.add_argument("--temporary-floor", type=float, default=0.05)
     cli.add_argument("--max-temporary-frames", type=int, default=24)
+    cli.add_argument("--face-mismatch-grace", type=int, default=3,
+                     help="Consecutive visible-face match misses tolerated before Temporary")
     cli.add_argument("--dead-zone", type=float, default=0.08)
     args = cli.parse_args()
     # Keep the whole-person command aligned with the project's documented

@@ -65,7 +65,7 @@ class WholePersonTrackingTests(unittest.TestCase):
 
     def test_face_and_body_detector_dropout_starts_temporary_from_last_body_box(self):
         target = person(200)
-        tracker = WholePersonTracker(lambda face: (True, 0.9), decay_rate=0.1,
+        tracker = WholePersonTracker(lambda face: (face.confidence > 0.95, 0.9), decay_rate=0.1,
                                      temporary_floor=0.01, max_temporary_frames=3)
         tracker.update([face_for(target)], [target], (480, 640, 3))
         missing = tracker.update([], [], (480, 640, 3))
@@ -73,7 +73,25 @@ class WholePersonTrackingTests(unittest.TestCase):
         self.assertIs(missing.person, target)
         self.assertEqual(missing.reason, "Face lost; holding last body box briefly")
 
-    def test_visible_different_face_drops_identity_to_unknown(self):
+    def test_unassociated_face_uses_grace_then_becomes_temporary(self):
+        target = person(200)
+        tracker = WholePersonTracker(lambda face: (face.confidence > 0.95, 0.9), decay_rate=0.1,
+                                     temporary_floor=0.01, max_temporary_frames=3)
+        tracker.update([face_for(target)], [target], (480, 640, 3))
+        unrelated_face = Face(np.array([500, 30, 40, 50], dtype=np.float32),
+                              np.zeros((5, 2), dtype=np.float32), 0.9)
+        missing = tracker.update([unrelated_face], [], (480, 640, 3))
+        self.assertEqual(missing.state, IdentityState.CONFIRMED)
+        self.assertEqual(missing.reason, "Face detected; smoothing identity mismatch")
+        missing = tracker.update([unrelated_face], [], (480, 640, 3))
+        self.assertEqual(missing.state, IdentityState.CONFIRMED)
+        missing = tracker.update([unrelated_face], [], (480, 640, 3))
+        self.assertEqual(missing.state, IdentityState.CONFIRMED)
+        missing = tracker.update([unrelated_face], [], (480, 640, 3))
+        self.assertEqual(missing.state, IdentityState.TEMPORARY)
+        self.assertIs(missing.person, target)
+
+    def test_unverified_face_on_locked_body_stays_temporary(self):
         target = person(200)
         tracker = WholePersonTracker(lambda face: (face.confidence > 0.95, 0.9), max_temporary_frames=5)
         self.assertEqual(tracker.update([face_for(target)], [target], (480, 640, 3)).state,
@@ -81,9 +99,30 @@ class WholePersonTrackingTests(unittest.TestCase):
         distractor = face_for(target)
         distractor = Face(distractor.box, distractor.points, 0.5)
         result = tracker.update([distractor], [target], (480, 640, 3))
-        self.assertEqual(result.state, IdentityState.UNKNOWN)
-        self.assertEqual(result.confidence, 0.0)
+        self.assertEqual(result.state, IdentityState.CONFIRMED)
+        result = tracker.update([distractor], [target], (480, 640, 3))
+        self.assertEqual(result.state, IdentityState.CONFIRMED)
+        result = tracker.update([distractor], [target], (480, 640, 3))
+        self.assertEqual(result.state, IdentityState.CONFIRMED)
+        result = tracker.update([distractor], [target], (480, 640, 3))
+        self.assertEqual(result.state, IdentityState.TEMPORARY)
+        self.assertLess(result.confidence, 1.0)
         self.assertIs(result.person, target)
+        self.assertIs(result.face, distractor)
+        self.assertEqual(result.reason, "Face unclear; locked body retained temporarily")
+
+    def test_unverified_face_becomes_unknown_after_lock_timeout(self):
+        target = person(200)
+        tracker = WholePersonTracker(lambda face: (face.confidence > 0.95, 0.9),
+                                     max_temporary_frames=1, temporary_floor=0.01,
+                                     face_mismatch_grace=0)
+        tracker.update([face_for(target)], [target], (480, 640, 3))
+        uncertain = face_for(target)
+        uncertain = Face(uncertain.box, uncertain.points, 0.5)
+        self.assertEqual(tracker.update([uncertain], [target], (480, 640, 3)).state,
+                         IdentityState.TEMPORARY)
+        expired = tracker.update([uncertain], [target], (480, 640, 3))
+        self.assertEqual(expired.state, IdentityState.UNKNOWN)
 
     def test_matching_visible_face_recovers_even_when_body_box_jumps(self):
         target = person(100)
